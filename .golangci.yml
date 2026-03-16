@@ -1,0 +1,18 @@
+version: "2"
+
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  enable:
+    - govet # Standard Go bug checker
+    - errcheck # Finds unchecked/ignored errors
+    - staticcheck # Advanced bug and performance checker
+    - unused # Finds unused code and variables
+    - ineffassign # Detects useless variable assignments
+    - goconst # Finds repeated strings that should be constants
+
+formatters:
+  enable:
+    - gofmt
