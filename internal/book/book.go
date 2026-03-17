@@ -120,3 +120,7 @@ func sortLevels(m map[string]string, isDescending bool) []domain.Level {
 
 	return sortedLevels
 }
+
+func (b *Book) Symbol() domain.Symbol {
+	return b.symbol
+}
