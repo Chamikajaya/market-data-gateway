@@ -3,6 +3,7 @@
 package book
 
 import (
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -76,4 +77,46 @@ func applyLevels(m map[string]string, levels []domain.Level) {
 		}
 
 	}
+}
+
+func (b *Book) BookSnapshot() domain.OrderBook {
+	// used by many go routines
+	// to get an immutable copy of the current orderbook state
+	b.mu.RLock()
+	defer b.mu.Unlock()
+
+	return domain.OrderBook{
+		Symbol:        b.symbol,
+		Bids:          sortLevels(b.bids, true),
+		Asks:          sortLevels(b.asks, false),
+		LastUpdatedAt: b.lastUpdated,
+	}
+
+}
+
+func sortLevels(m map[string]string, isDescending bool) []domain.Level {
+	if (len(m)) == 0 {
+		return nil
+	}
+
+	sortedLevels := make([]domain.Level, 0, len(m))
+	// map to slice
+	for price, quantity := range m {
+		sortedLevels = append(sortedLevels, domain.Level{Price: price, Quantity: quantity})
+	}
+
+	sort.Slice(sortedLevels, func(i, j int) bool {
+
+		// ! TODO: Ignoring the error here -> need to handle the error parsing at adapter level
+		price_i, _ := strconv.ParseFloat(sortedLevels[i].Price, 64)
+		price_j, _ := strconv.ParseFloat(sortedLevels[j].Price, 64)
+
+		if isDescending {
+			return price_i > price_j
+		}
+
+		return price_i < price_j
+	})
+
+	return sortedLevels
 }
