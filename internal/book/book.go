@@ -3,6 +3,7 @@
 package book
 
 import (
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,9 +49,31 @@ func (b *Book) Apply(u domain.Update) {
 		}
 
 	case domain.UpdateTypeDelta:
-		// TODO
+		applyLevels(b.bids, u.Bids)
+		applyLevels(b.asks, u.Asks)
 	}
 
 	b.lastUpdated = u.ReceivedAt
 
+}
+
+func isQuantityZero(quantity string) bool {
+	f, err := strconv.ParseFloat(quantity, 64)
+	if err != nil {
+		return false
+	}
+	return f == 0
+}
+
+func applyLevels(m map[string]string, levels []domain.Level) {
+
+	for _, level := range levels {
+		// if the quantity is zero -> delete from map
+		if isQuantityZero(level.Quantity) {
+			delete(m, level.Price)
+		} else {
+			m[level.Price] = level.Quantity
+		}
+
+	}
 }
