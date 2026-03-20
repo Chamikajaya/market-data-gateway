@@ -113,9 +113,18 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 	out := make(chan domain.Update, wsBufferSize)
 
 	// go routine to run the snapshot -> sync -> stream
-	// TODO:
+
 	go func() {
 		defer close(out)
+
+		if err := a.syncAndStream(ctx, sym, native, buffer, out); err != nil {
+			select {
+			case <-ctx.Done():
+				// clean shutdown - not an error
+			default:
+				slog.Error("sync and stream", "err", err, "symbol", sym)
+			}
+		}
 	}()
 
 	return out, nil
