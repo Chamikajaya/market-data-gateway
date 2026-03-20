@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -58,18 +59,6 @@ func (a *Adapter) Run(ctx context.Context) (<-chan domain.Update, error) {
 // * managing the full lifecycle for one symbol
 // buffer ws events -> fetch REST snapshot -> synchronize -> stream incremental deltas
 func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan domain.Update, error) {
-	// TODO:
-
-	// ! TEMP USAGE TO PASS THE LINT
-	_ = canonicalToBinanceNative(sym)
-
-	var r restDepthResponse
-	var w wsDepthEvent
-
-	_ = binancePairsToLevels(r.Bids)
-	_ = w.Symbol
-
-	_, _ = a.fetchSnapshot(ctx, "test")
 
 	native := canonicalToBinanceNative(sym)
 	wsURL := fmt.Sprintf("%s/%s@depth", wsBaseURL, strings.ToLower(native)) // binance's ws endpoint requres lowercase
@@ -91,7 +80,7 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 			}
 		}()
 
-		// read loop
+		// read loop - infinite
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -130,6 +119,108 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 	}()
 
 	return out, nil
+
+}
+
+// sentinel error -> when the buffer has a gap relative to the snapshot, in such cases should refetch the snapshot
+var errDesynced = fmt.Errorf("event sequence gap detected")
+
+func (a *Adapter) syncAndStream(
+	ctx context.Context,
+	sym domain.Symbol,
+	native string,
+	buffer <-chan wsDepthEvent, // function reads from buffer
+	out chan<- domain.Update, // function writes to out
+) error {
+
+	for {
+
+		if err := ctx.Err(); err != nil {
+			return err // since normal shutdown
+		}
+
+		snap, err := a.fetchSnapshot(ctx, native) // while fetching snapshot, the ws reader goroutine is buffering the incoming events in the buffer channel
+
+		if err != nil {
+			return fmt.Errorf("fetch snapshot for %s: %w", sym, err)
+		}
+		slog.Info("binance fetched snapshot", "symbol", sym, "snapshotUpdateID", snap.LastUpdateID)
+
+		select {
+		case out <- toSnapshotUpdate(adapterName, sym, snap):
+		case <-ctx.Done():
+			return nil
+		}
+
+		if err := a.drainAndVerify(ctx, sym, int64(snap.LastUpdateID), buffer, out); err != nil {
+			if err == errDesynced {
+				slog.Warn("binance desynced, refetching snapshot", "symbol", sym)
+				continue
+			}
+			return err
+		}
+
+		// live streaming of events after synchronization
+		for {
+			select {
+			case event, ok := <-buffer:
+				if !ok {
+					return nil
+				}
+				select {
+				case out <- toDeltaUpdate(adapterName, sym, event):
+				case <-ctx.Done():
+					return nil
+				}
+			case <-ctx.Done():
+				return nil
+			}
+		}
+
+	}
+
+}
+
+// processes the buffered ws events after fetching the snapshot
+func (a *Adapter) drainAndVerify(
+	ctx context.Context,
+	sym domain.Symbol,
+	snapshotID int64,
+	buffer <-chan wsDepthEvent,
+	out chan<- domain.Update,
+) error {
+
+	firstValid := true
+
+	for {
+		select {
+		case event, ok := <-buffer:
+			if !ok {
+				return nil
+			}
+			if event.FinalUpdateID <= snapshotID {
+				continue // discard stale events which are already reflected in the snapshot
+			}
+			if firstValid {
+				// there is a gap between the snapshot and the first valid event in the buffer --> need to refetch
+				if event.FirstUpdateID > snapshotID+1 {
+					return errDesynced
+				}
+				firstValid = false // never come here again since the first valid event is found
+			}
+
+			select {
+			case out <- toDeltaUpdate(adapterName, sym, event): // forwarding the valid event to the out channel
+			case <-ctx.Done():
+				return nil
+			}
+
+		// if buffer has no events
+		default:
+			return nil
+		}
+
+	}
 
 }
 
@@ -172,6 +263,28 @@ func binancePairsToLevels(pairs [][2]string) []domain.Level {
 	}
 	return levels
 
+}
+
+func toSnapshotUpdate(exchange string, sym domain.Symbol, snap restDepthResponse) domain.Update {
+	return domain.Update{
+		Exchange:   exchange,
+		Symbol:     sym,
+		Type:       domain.UpdateTypeSnapshot,
+		Bids:       binancePairsToLevels(snap.Bids),
+		Asks:       binancePairsToLevels(snap.Asks),
+		ReceivedAt: time.Now(),
+	}
+}
+
+func toDeltaUpdate(exchange string, sym domain.Symbol, event wsDepthEvent) domain.Update {
+	return domain.Update{
+		Exchange:   exchange,
+		Symbol:     sym,
+		Type:       domain.UpdateTypeDelta,
+		Bids:       binancePairsToLevels(event.Bids),
+		Asks:       binancePairsToLevels(event.Asks),
+		ReceivedAt: time.Now(),
+	}
 }
 
 func (a *Adapter) fetchSnapshot(ctx context.Context, native string) (snap restDepthResponse, err error) {
