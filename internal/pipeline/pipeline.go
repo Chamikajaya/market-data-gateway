@@ -38,7 +38,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 
 	sources := make([]<-chan domain.Update, 0, len(p.exchanges))
 	for _, exc := range p.exchanges {
-		ch, err := exc.Run(ctx)
+		ch, err := exc.Run(ctx) // starting all exchange adapters
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: start exchange %q: %w", exc.Name(), err) // %q -> print exchange name inside ""
 		}
@@ -46,12 +46,13 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 		sources = append(sources, ch)
 	}
 
-	// intermediary channel
-	// ? do we really need an intermediary channel ?
+	// intermediary channel - since we have multiple exchanges running at the exact same time , firing updates asynchronously, if multiple exchanges tried to write directly to the "out" channel / tries to write to Registry simultaneously from a dozen different goroutines, race conditions could occur. so to mitigate this, "merged" channel acts as a funnel. because of this applyAndForward and run in just 1 goroutine
+	// * 1 evt / 250 ms = 4 evt per sec per symbol => 64 / 4 = ~15 sec safety margin
 	merged := make(chan domain.Update, len(sources)*64) // !TODO: 64 to be taken from the config
+
 	// output channel sent to server
+	// * 256 -> absorb the initital burst of snapshots on startup
 	out := make(chan domain.Update, 256) // TODO: to be taken from the config
-	_ = out
 
 	var wg sync.WaitGroup
 	wg.Add(len(sources))
@@ -78,6 +79,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 	return out, nil
 }
 
+// take an update from an exchange and transfer it into the "merged" funnel
 func (p *Pipeline) feedFrom(ctx context.Context, src <-chan domain.Update, merged chan<- domain.Update) {
 	for {
 		select {

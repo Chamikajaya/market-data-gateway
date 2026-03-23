@@ -24,3 +24,28 @@
 **Next**:
 
 * Test the functionality end-to-end with binance adapter before moving on to the next exchange (kraken)
+
+
+### 2026-03-23 — Core Pipeline and State Registry
+**Goal**: Implement pipeline.go to merge multiple exchange streams into a single funnel and update the central order book Registry safely.
+
+**What worked**:
+
+* Using a consumer-defined Exchanger interface inside the pipeline package kept the core completely decoupled from exchange-specific logic.
+
+
+What broke (and why):
+
+* Slow downstream clients could freeze the entire gateway >> a standard channel send (out <- update) blocks if the buffer is full >> used a select with a default case to intentionally drop updates to protect the pipeline's speed.
+
+**Concept unlocked:**
+
+* Graceful degradation: in high-frequency trading systems, it is better to intentionally drop data on the floor (using non-blocking channel sends) than to let a slow consumer stall the central state machine.
+
+**Still fuzzy:**
+
+* How the actual WebSocket server is going to take this single out channel and broadcast it to hundreds of clients without creating a massive bottleneck.
+
+**Next**:
+
+* Implement server.go to handle downstream WebSocket clients.
