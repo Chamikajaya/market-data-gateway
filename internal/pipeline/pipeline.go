@@ -6,25 +6,29 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"market-gw.com/internal/book"
 	"market-gw.com/internal/domain"
-	"market-gw.com/internal/exchange"
 )
 
+// pipeline is the consumer & currently binance is the implementation
+type Exchanger interface {
+	Run(ctx context.Context) (<-chan domain.Update, error)
+	Name() string
+}
+
 type Pipeline struct {
-	exchanges []exchange.Exchange
+	exchanges []Exchanger
 	registry  *book.Registry
 }
 
-func NewPipeline(exchanges []exchange.Exchange, registry *book.Registry) *Pipeline {
+func NewPipeline(exchanges []Exchanger, registry *book.Registry) *Pipeline {
 	return &Pipeline{
 		exchanges: exchanges,
 		registry:  registry,
 	}
 }
-
-// ! TODO: Name() method ?
 
 func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 
@@ -42,5 +46,86 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 		sources = append(sources, ch)
 	}
 
-	return nil, nil
+	// intermediary channel
+	// ? do we really need an intermediary channel ?
+	merged := make(chan domain.Update, len(sources)*64) // !TODO: 64 to be taken from the config
+	// output channel sent to server
+	out := make(chan domain.Update, 256) // TODO: to be taken from the config
+	_ = out
+
+	var wg sync.WaitGroup
+	wg.Add(len(sources))
+
+	for _, src := range sources {
+		go func() {
+			defer wg.Done()
+			p.feedFrom(ctx, src, merged)
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(merged)
+		slog.Info("pipeline: all exchange sources exhausted, merged channel was closed")
+	}()
+
+	go func() {
+		defer close(out)
+		p.applyAndForward(merged, out)
+		slog.Info("pipeline: apply goroutine exited, out channel closed")
+	}()
+
+	return out, nil
+}
+
+func (p *Pipeline) feedFrom(ctx context.Context, src <-chan domain.Update, merged chan<- domain.Update) {
+	for {
+		select {
+		case update, ok := <-src:
+			if !ok {
+				return
+			}
+			select {
+			case merged <- update:
+			case <-ctx.Done():
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *Pipeline) applyAndForward(merged <-chan domain.Update, out chan<- domain.Update) {
+	for update := range merged {
+		b := p.registry.GetOrCreate(update.Symbol)
+		b.Apply(update)
+
+		slog.Info("pipeline: applied update",
+			"type", updateTypeName(update.Type),
+			"symbol", update.Symbol,
+			"exchange", update.Exchange,
+			"bids", len(update.Bids),
+			"asks", len(update.Asks),
+		)
+
+		select {
+		case out <- update:
+		default:
+			slog.Info("pipeline: out channel full, dropping update",
+				"symbol", update.Symbol,
+			)
+		}
+	}
+}
+
+func updateTypeName(t domain.UpdateType) string {
+	switch t {
+	case domain.UpdateTypeSnapshot:
+		return "snapshot"
+	case domain.UpdateTypeDelta:
+		return "delta"
+	default:
+		return "unknown"
+	}
 }
