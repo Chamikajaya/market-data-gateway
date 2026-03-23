@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,14 +17,19 @@ import (
 )
 
 // ! TODO:- Need to take the constants from the config instead
-const (
-	restBaseURL  = "https://api.binance.com"
-	wsBaseURL    = "wss://stream.binance.com:9443/ws"
-	adapterName  = "binance"
-	wsBufferSize = 200 // ! TODO:- Need to take the constants from the config instead
 
+// ! TODO: Need to break down binance.go after implementing kraken adapter as well - need to make it more abstract
+const (
+	restBaseURL = "https://api.binance.com"
+	wsBaseURL   = "wss://stream.binance.com:9443/ws"
+	adapterName = "binance"
+	// how many ws events we buffer while REST snapshot is being fetched
+	// https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Diff-Book-Depth-Streams
+	// if binance emits 1 event / 250 ms -> 200 slots means 50 seconds of buffer ~ should be enough for a REST roundtrip
+	wsBufferSize = 200
 )
 
+// * implements the exchange interface -> duck typing
 type Adapter struct {
 	symbols []domain.Symbol
 	depth   int
@@ -31,7 +37,7 @@ type Adapter struct {
 
 func NewAdapter(symbols []domain.Symbol, depth int) *Adapter {
 	return &Adapter{
-		symbols: symbols,
+		symbols: symbols, // takes in canonical symbol
 		depth:   depth,
 	}
 }
@@ -41,21 +47,23 @@ func (a *Adapter) Name() string {
 }
 
 func (a *Adapter) Run(ctx context.Context) (<-chan domain.Update, error) {
-
 	if len(a.symbols) == 0 {
 		return nil, fmt.Errorf("binance: no symbols have been configured")
 	}
 
-	// TODO: Needs to run the Run function for each symbol configured in its own goroutine -> And then need to fan-in to a single merged channel
-	for _, sym := range a.symbols {
-		_, _ = a.runSymbol(ctx, sym)
+	perSymbol := make([]<-chan domain.Update, len(a.symbols))
+	for i, sym := range a.symbols {
+		ch, err := a.runSymbol(ctx, sym)
+		if err != nil {
+			return nil, fmt.Errorf("binance: start symbol %s: %w", sym, err)
+		}
+		perSymbol[i] = ch
 	}
 
-	return nil, nil
-
+	return fanin(ctx, perSymbol), nil
 }
 
-// TODO: Need to implement this according to -> "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly"
+// "https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly"
 // * managing the full lifecycle for one symbol
 // buffer ws events -> fetch REST snapshot -> synchronize -> stream incremental deltas
 func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan domain.Update, error) {
@@ -71,7 +79,7 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 
 	buffer := make(chan wsDepthEvent, wsBufferSize)
 
-	// ws reader goroutine
+	// ws reader goroutine -> pumps raw ws messages into the buffer
 	go func() {
 		defer func() {
 			close(buffer)
@@ -102,7 +110,7 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 			select {
 			case buffer <- event: // send the event to the buffer channel
 			case <-ctx.Done():
-				return
+				return // return and run trigger defer func
 			default:
 				slog.Warn("ws buffer full, dropping event", "symbol", sym)
 			}
@@ -112,8 +120,7 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 
 	out := make(chan domain.Update, wsBufferSize)
 
-	// go routine to run the snapshot -> sync -> stream
-
+	// go routine to run syncAndStream
 	go func() {
 		defer close(out)
 
@@ -134,18 +141,20 @@ func (a *Adapter) runSymbol(ctx context.Context, sym domain.Symbol) (<-chan doma
 // sentinel error -> when the buffer has a gap relative to the snapshot, in such cases should refetch the snapshot
 var errDesynced = fmt.Errorf("event sequence gap detected")
 
+// snapshot -> sync -> stream
 func (a *Adapter) syncAndStream(
 	ctx context.Context,
 	sym domain.Symbol,
 	native string,
-	buffer <-chan wsDepthEvent, // function reads from buffer
-	out chan<- domain.Update, // function writes to out
+	buffer <-chan wsDepthEvent, // function reads from buffer channel
+	out chan<- domain.Update, // function writes to out channel
 ) error {
 
 	for {
 
+		// catching the shutdown signal if the main program has sent any and aborting the operation
 		if err := ctx.Err(); err != nil {
-			return err // since normal shutdown
+			return err
 		}
 
 		snap, err := a.fetchSnapshot(ctx, native) // while fetching snapshot, the ws reader goroutine is buffering the incoming events in the buffer channel
@@ -161,6 +170,7 @@ func (a *Adapter) syncAndStream(
 			return nil
 		}
 
+		// draining the buffer -> discarding stale events -> verifying the sync
 		if err := a.drainAndVerify(ctx, sym, int64(snap.LastUpdateID), buffer, out); err != nil {
 			if err == errDesynced {
 				slog.Warn("binance desynced, refetching snapshot", "symbol", sym)
@@ -169,7 +179,7 @@ func (a *Adapter) syncAndStream(
 			return err
 		}
 
-		// live streaming of events after synchronization
+		// live streaming of events after synchronization, until the context is done
 		for {
 			select {
 			case event, ok := <-buffer:
@@ -210,7 +220,7 @@ func (a *Adapter) drainAndVerify(
 			if event.FinalUpdateID <= snapshotID {
 				continue // discard stale events which are already reflected in the snapshot
 			}
-			if firstValid {
+			if firstValid { // first non-stale event
 				// there is a gap between the snapshot and the first valid event in the buffer --> need to refetch
 				if event.FirstUpdateID > snapshotID+1 {
 					return errDesynced
@@ -233,6 +243,39 @@ func (a *Adapter) drainAndVerify(
 
 }
 
+func (a *Adapter) fetchSnapshot(ctx context.Context, native string) (restDepthResponse, error) {
+	url := fmt.Sprintf("%s/api/v3/depth?symbol=%s&limit=%d", restBaseURL, native, a.depth)
+
+	// use WithContext for graceful shutdown -> so that if ctrl+c comes while this request is made, go will kill the request instead of leaving the go routine hanging
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return restDepthResponse{}, fmt.Errorf("build request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return restDepthResponse{}, fmt.Errorf("http get: %w", err)
+	}
+
+	// closing the response body, otherwise the connection remains open. when closed, will release the underlying tcp connection back to the client's connection pool, so it can be later re-used
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// ! TODO: Get 512 from config file instead
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) // reading the first 512 bytes only in error response - what if binance returns a huge error page
+		return restDepthResponse{}, fmt.Errorf("http %d: %s", resp.StatusCode, body)
+
+	}
+
+	var result restDepthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return restDepthResponse{}, fmt.Errorf("decode response: %w", err)
+	}
+
+	return result, nil
+
+}
+
 // GET https://api.binance.com/api/v3/depth
 type restDepthResponse struct {
 	LastUpdateID int         `json:"lastUpdateId"`
@@ -245,8 +288,8 @@ type wsDepthEvent struct {
 	EventType     string      `json:"e"`
 	EventTime     int64       `json:"E"`
 	Symbol        string      `json:"s"`
-	FirstUpdateID int64       `json:"U"`
-	FinalUpdateID int64       `json:"u"`
+	FirstUpdateID int64       `json:"U"` // id of the first change contained within this specific batch of updates
+	FinalUpdateID int64       `json:"u"` // id of the last change contained within this specific batch of updates
 	Bids          [][2]string `json:"b"`
 	Asks          [][2]string `json:"a"`
 }
@@ -296,39 +339,42 @@ func toDeltaUpdate(exchange string, sym domain.Symbol, event wsDepthEvent) domai
 	}
 }
 
-func (a *Adapter) fetchSnapshot(ctx context.Context, native string) (snap restDepthResponse, err error) {
+func fanin(ctx context.Context, channels []<-chan domain.Update) <-chan domain.Update {
 
-	url := fmt.Sprintf("%s/api/v3/depth?symbol=%s&limit=%d", restBaseURL, native, a.depth)
+	merged := make(chan domain.Update, len(channels)*wsBufferSize)
 
-	// use WithContext for graceful shutdown -> so that if ctrl+c comes while this request is made, go will kill the request instead of leaving the go routine hanging
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return restDepthResponse{}, fmt.Errorf("build request: %w", err)
+	var wg sync.WaitGroup
+	wg.Add(len(channels))
+
+	for _, ch := range channels {
+		ch := ch
+
+		go func() {
+			defer wg.Done()
+
+			for {
+				select {
+				case update, ok := <-ch:
+					if !ok {
+						return
+					}
+					select {
+					case merged <- update:
+					case <-ctx.Done():
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return restDepthResponse{}, fmt.Errorf("http get: %w", err)
-	}
-	// closing the TCP connection
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-			err = fmt.Errorf("close body: %w", closeErr)
-		}
+	go func() {
+		wg.Wait()
+		close(merged)
 	}()
 
-	if resp.StatusCode != http.StatusOK {
-		// ! TODO: Get 512 from config file instead
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512)) // reading the first 512 bytes only in error response
-		return restDepthResponse{}, fmt.Errorf("http %d: %s", resp.StatusCode, body)
-
-	}
-
-	var result restDepthResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return restDepthResponse{}, fmt.Errorf("decode response: %w", err)
-	}
-
-	return result, nil
+	return merged
 
 }
