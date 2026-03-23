@@ -339,15 +339,15 @@ func toDeltaUpdate(exchange string, sym domain.Symbol, event wsDepthEvent) domai
 	}
 }
 
+// creating the master stream
 func fanin(ctx context.Context, channels []<-chan domain.Update) <-chan domain.Update {
 
 	merged := make(chan domain.Update, len(channels)*wsBufferSize)
 
 	var wg sync.WaitGroup
-	wg.Add(len(channels))
+	wg.Add(len(channels)) // launching goroutines per each channel
 
 	for _, ch := range channels {
-		ch := ch
 
 		go func() {
 			defer wg.Done()
@@ -359,11 +359,11 @@ func fanin(ctx context.Context, channels []<-chan domain.Update) <-chan domain.U
 						return
 					}
 					select {
-					case merged <- update:
-					case <-ctx.Done():
+					case merged <- update: // moving data from individual channel to merged channel
+					case <-ctx.Done(): // shut down signal received while trying to transfer
 						return
 					}
-				case <-ctx.Done():
+				case <-ctx.Done(): // shut down signal received while waiting to read from channel
 					return
 				}
 			}
@@ -371,7 +371,7 @@ func fanin(ctx context.Context, channels []<-chan domain.Update) <-chan domain.U
 	}
 
 	go func() {
-		wg.Wait()
+		wg.Wait() // to wait until every other launched goroutine is done  - wg counter == 0
 		close(merged)
 	}()
 

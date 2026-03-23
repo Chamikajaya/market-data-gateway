@@ -6,7 +6,7 @@ import (
 	"market-gw.com/internal/domain"
 )
 
-// Registry holds the order books for configured symbols.
+// Registry holds the order books for configured symbols. - tracking more than one symbol at the same time
 type Registry struct {
 	mu    sync.Mutex
 	books map[domain.Symbol]*Book // symbol:book

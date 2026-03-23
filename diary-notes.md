@@ -89,3 +89,60 @@ func doSomething() (err error) {
 
 
 ### wait-groups
+
+* It allows  program to wait for a specific collection of goroutines to finish their execution before moving on to the next part of the code.
+
+* By default, if we launch ten goroutines to do work and then reach the end of  main() function, the program exits immediately. It doesn't care if those goroutines are 1% or 99% done it just shuts down the shop.
+
+* Without a WaitGroup we have to use workrounds like time.Sleep(5 * time.Second), which is inefficient.
+
+**How wait-groups work**
+
+1. ```Add(int)```: Increments the internal counter. call this before starting a goroutine 
+2. ```Done()```: Decrements the counter by 1.  call this inside the goroutine (usually with defer)  
+3. ```Wait()```: Blocks the execution of the main thread until the counter reaches zero.
+
+
+```go
+
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func downloadImage(id int, wg *sync.WaitGroup) {
+	// 1. Ensure the counter is decremented when the function returns
+	defer wg.Done()
+
+	fmt.Printf("Starting download: Image %d\n", id)
+	
+	// Simulating a network request delay
+	time.Sleep(time.Second * 2) 
+	
+	fmt.Printf("Finished download: Image %d\n", id)
+}
+
+func main() {
+	var wg sync.WaitGroup
+	images := []int{1, 2, 3, 4, 5}
+
+	for _, id := range images {
+		// 2. Increment the counter BEFORE starting the goroutine
+		wg.Add(1)
+		
+		go downloadImage(id, &wg) // Pass as a pointer!
+	}
+
+	fmt.Println("Main: Waiting for all downloads to finish...")
+
+	// 3. Block here until the counter reaches 0
+	wg.Wait()
+
+	fmt.Println("Main: All images downloaded. Proceeding to image optimization.")
+}
+
+
+```
