@@ -53,7 +53,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Symbol, error) {
 
 	// output channel sent to server
 	// * 256 -> absorb the initital burst of snapshots on startup
-	out := make(chan domain.Symbol, 256) // TODO: to be taken from the config
+	out := make(chan domain.Symbol, 256) // TODO: to be taken from the config  + now that I changed the content of this channel from domain.update to domain.Symbol is 256 still needed ?
 
 	var wg sync.WaitGroup
 	wg.Add(len(sources))
@@ -73,7 +73,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Symbol, error) {
 
 	go func() {
 		defer close(out)
-		p.applyAndNotify(merged, out) // ! todo: need to change
+		p.applyAndNotify(merged, out)
 		slog.Info("pipeline: apply goroutine exited, out channel closed")
 	}()
 
