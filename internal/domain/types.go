@@ -11,27 +11,6 @@ type Level struct {
 	Quantity string
 }
 
-// to which side of the order book an update belongs to
-type Side int8
-
-// * iota -> to create a sequence of related integer values
-const (
-	SideBid Side = iota // buyers -> highest price wins
-	SideAsk             // sellers -> lowest price wins
-)
-
-// implementing the fmt.Stringer - for readable logging
-func (s Side) String() string {
-	switch s {
-	case SideBid:
-		return "bid"
-	case SideAsk:
-		return "ask"
-	default:
-		return "unknown"
-	}
-}
-
 type UpdateType int8
 
 const (
