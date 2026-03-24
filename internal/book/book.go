@@ -79,6 +79,7 @@ func applyLevels(m map[string]string, levels []domain.Level) {
 	}
 }
 
+// ! TODO: Need to use this sorted BookSnapshot when sending to down stream clients
 func (b *Book) BookSnapshot() domain.OrderBook {
 	// used by many go routines
 	// to get an immutable copy of the current orderbook state

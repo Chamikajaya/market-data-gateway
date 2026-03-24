@@ -30,7 +30,8 @@ func NewPipeline(exchanges []Exchanger, registry *book.Registry) *Pipeline {
 	}
 }
 
-func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
+// returning the channel that emits the canonical Symbol for every book that has just been updated
+func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Symbol, error) {
 
 	if (len(p.exchanges)) == 0 {
 		return nil, fmt.Errorf("pipeline: no exchange configured")
@@ -52,7 +53,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 
 	// output channel sent to server
 	// * 256 -> absorb the initital burst of snapshots on startup
-	out := make(chan domain.Update, 256) // TODO: to be taken from the config
+	out := make(chan domain.Symbol, 256) // TODO: to be taken from the config
 
 	var wg sync.WaitGroup
 	wg.Add(len(sources))
@@ -72,7 +73,7 @@ func (p *Pipeline) Run(ctx context.Context) (<-chan domain.Update, error) {
 
 	go func() {
 		defer close(out)
-		p.applyAndForward(merged, out)
+		p.applyAndNotify(merged, out) // ! todo: need to change
 		slog.Info("pipeline: apply goroutine exited, out channel closed")
 	}()
 
@@ -98,7 +99,7 @@ func (p *Pipeline) feedFrom(ctx context.Context, src <-chan domain.Update, merge
 	}
 }
 
-func (p *Pipeline) applyAndForward(merged <-chan domain.Update, out chan<- domain.Update) {
+func (p *Pipeline) applyAndNotify(merged <-chan domain.Update, out chan<- domain.Symbol) {
 	for update := range merged {
 		b := p.registry.GetOrCreate(update.Symbol)
 		b.Apply(update)
@@ -111,8 +112,9 @@ func (p *Pipeline) applyAndForward(merged <-chan domain.Update, out chan<- domai
 			"asks", len(update.Asks),
 		)
 
+		// notifying the server of which symbol changed
 		select {
-		case out <- update:
+		case out <- update.Symbol:
 		default:
 			slog.Info("pipeline: out channel full, dropping update",
 				"symbol", update.Symbol,
