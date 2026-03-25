@@ -9,7 +9,7 @@ import (
 // Registry holds the order books for configured symbols. - tracking more than one symbol at the same time
 type Registry struct {
 	mu    sync.Mutex
-	books map[domain.Symbol]*Book // symbol:book  // todo: decide whether to use Orderbook type or Book type - also where to apply sorting ?
+	books map[domain.Symbol]*Book // symbol:book  // ! TODO: With the updated req needs to change the key - user needs to configure what s the symbol as well as what is his preferred excgange - sufficient to get the delta updates from the configured exchnage as well
 }
 
 func NewRegistry() *Registry {

@@ -2,9 +2,12 @@ package domain
 
 import "time"
 
+// ! TODO: Use better naming with semantic meaning
+
 // ticker
 type Symbol string
 
+// ! TODO: rename to price point instead
 type Level struct {
 	// used string to avoid floating point errors - consumers have to parse to decimal
 	Price    string

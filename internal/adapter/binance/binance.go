@@ -51,6 +51,9 @@ func (a *Adapter) Run(ctx context.Context) (<-chan domain.Update, error) {
 		return nil, fmt.Errorf("binance: no symbols have been configured")
 	}
 
+	// ! refactor the channel name
+	// ! TODO: Rather than using multiple websocket connections for each symbol, use single connection at the startup and subscribve to multiple signals initially at the startup - not when a new client connects
+	// ! README with how to run
 	perSymbol := make([]<-chan domain.Update, len(a.symbols))
 	for i, sym := range a.symbols {
 		ch, err := a.runSymbol(ctx, sym)
