@@ -49,3 +49,20 @@ What broke (and why):
 **Next**:
 
 * Implement server.go to handle downstream WebSocket clients.
+
+### 2026-03-25 — WebSocket Server 
+
+**Goal:** Implement server.go to handle downstream WebSocket clients, manage symbol subscriptions, and safely broadcast updates without bottlenecking the gateway.
+
+**What worked:** 
+* The current pattern kept the clients map completely lock-free. Since only the Hub goroutine touches the map, no mutexes were needed.
+* Using an empty struct (map[domain.Symbol]struct{}) created a zero-byte memory footprint Set for tracking client subscriptions.
+
+**What broke (and why):** 
+* Fatal panic from concurrent WebSocket writes >> gorilla/websocket explicitly forbids multiple goroutines writing to the same connection simultaneously >> fixed by strictly forcing sendInitialSnapshots to finish completely before launching the client's ongoing write goroutine.
+
+**Concept unlocked:** "Share memory by communicating" >> instead of wrapping a global client map in a lock, giving the Hub exclusive ownership of the map and forcing clients to send a registration ticket over a channel entirely avoids race conditions.
+
+**Still fuzzy:** In code review we had today, asked to consider creating ws connedctions at the start of the app and also advised not to create separate ws connection per each tracked symbol.
+
+**Next:** Wire everything together in cmd/gateway/main.go using the os/signal package for graceful shutdown.
