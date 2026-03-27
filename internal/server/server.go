@@ -1,5 +1,3 @@
-// runs the downstream ws server - accepts client connections - send book snapshots on initial connect and then streams incremental delta updates as they arrive from the pipeline
-
 package server
 
 import (
@@ -17,59 +15,62 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // allowing every origin
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// sent to clients.
 type bookMessage struct {
 	Type      string         `json:"type"`
+	Exchange  string         `json:"exchange"`
 	Symbol    string         `json:"symbol"`
 	Bids      []domain.Level `json:"bids"`
 	Asks      []domain.Level `json:"asks"`
 	Timestamp string         `json:"timestamp"`
 }
 
-type subscribeMessage struct {
-	Subscribe []string `json:"subscribe"`
+// clients send on connect -> Eg: {"subscribe": [{"exchange":"binance","symbol":"BTCUSDT"}]}
+type subscribeRequest struct {
+	Subscribe []struct {
+		Exchange string `json:"exchange"`
+		Symbol   string `json:"symbol"`
+	} `json:"subscribe"`
 }
 
-// what the hub sends to a client goroutine - when the pipeline tells the hub that a symbol has changed, the hub sends this to the client's personal channel
+// what the hub sends to a per-client channel when a book changes
 type notification struct {
-	Symbol domain.Symbol
-	isFull bool // true if the update is a full snapshot, false if it's a delta update
+	key domain.BookKey
 }
 
-// sent by a new client to the hub
 type registration struct {
-	symbols  map[domain.Symbol]struct{} // symbols the client is interested in - created a set here since we need to check whether a symbol exists in the client's subscription list or not
-	notifyCh chan<- notification        // hub is allowed to write only
-	done     <-chan struct{}            // to signal the hub that the client has disconnected - hub is able to read only
+	keys     map[domain.BookKey]struct{} // what the client subscribed to
+	notifyCh chan<- notification         // hub writes here
+	done     <-chan struct{}             // hub reads to detect disconnect
 }
 
 type Config struct {
 	Addr         string
-	WriteTimeout time.Duration // how long to wait before timing out a write to a client
-	PingInterval time.Duration // how often to send ping messages to clients to check if they are still alive
+	WriteTimeout time.Duration
+	PingInterval time.Duration
 }
 
 type Server struct {
 	cfg      Config
 	registry *book.Registry
 
-	register chan registration
-	changed  <-chan domain.Symbol // from pipeline - which symbol changed
+	register chan registration     // clients send registration requests here
+	changed  <-chan domain.BookKey // pipeline sends changed book keys here
 }
 
-func NewServer(cfg Config, registry *book.Registry, changed <-chan domain.Symbol) *Server {
+func NewServer(cfg Config, registry *book.Registry, changed <-chan domain.BookKey) *Server {
 	return &Server{
 		cfg:      cfg,
 		registry: registry,
-		register: make(chan registration, 32), // registration queue limit = 32 --> if more than 32 clients try to connect at the same time, the 33rd client will be blocked until there is space - to now overwhelm the hub
+		register: make(chan registration, 32),
 		changed:  changed,
 	}
 }
 
 func (s *Server) Run(ctx context.Context) error {
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWS)
 
@@ -82,85 +83,85 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	slog.Info("server: listening for client connections", "addr", s.cfg.Addr)
+	slog.Info("server: listening", "addr", s.cfg.Addr)
 
 	var wg sync.WaitGroup
 
 	wg.Add(1)
+	// launching the hub goroutine
 	go func() {
 		defer wg.Done()
 		s.runHub(ctx)
 	}()
 
 	wg.Add(1)
+	// launching the http server goroutine
 	go func() {
 		defer wg.Done()
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			slog.Error("server: HTTP server error", "error", err)
+			slog.Error("server: HTTP error", "error", err)
 		}
 	}()
 
 	<-ctx.Done()
-	slog.Info("server: shutdown signal received, shutting down HTTP server")
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // ! take from config
+	slog.Info("server: shutting down")
+	
+	// graceful shutdown with 5 seconds timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdownCtx)
-
+	
+	// waits for the hub and http server goroutines to exit
 	wg.Wait()
 	slog.Info("server: shutdown complete")
 	return nil
-
 }
 
-// should be responsible for client map - receive symbol change notifications from pipeline and then fan out to relevant clients
 func (s *Server) runHub(ctx context.Context) {
 
-	// client map
-	clients := make(map[chan<- notification]registration)
+	// runHub is run in a single goroutine + owns the client map -> no mutexes needed since there is no concurrent access to the client map
+	clients := make(map[chan<- notification]registration)  // key: client's notification channel - each channel is unique in go
 
 	for {
 		select {
+		// CASE 1 :- New client registration
 		case reg := <-s.register:
-			clients[reg.notifyCh] = registration{
-				symbols:  reg.symbols,
-				notifyCh: reg.notifyCh,
-				done:     reg.done,
-			}
-			slog.Info("server: new client registered", "symbols", reg.symbols, "total_clients", len(clients))
-
-		case sym, ok := <-s.changed: // listening to the pipeline
+			clients[reg.notifyCh] = reg
+			slog.Info("server: client registered", "keys", reg.keys, "total", len(clients))
+		
+		// CASE 2 :- A book changed, notify interested clients
+		case key, ok := <-s.changed:
+			// if pipeline is done, closing every client's notification channel
 			if !ok {
-				// pipeline has closed the channel - no more updates will come - so closing all client  channels
-				slog.Info("server: pipeline closed, disconnecting", "remaining_clients", len(clients))
+				slog.Info("server: pipeline closed, disconnecting clients", "count", len(clients))
 				for _, entry := range clients {
 					close(entry.notifyCh)
 				}
 				return
 			}
+			
+			// fan out to interested clients
 			for ch, entry := range clients {
-				// before hub sends update to a client checking their entry.done channel
 				select {
-				case <-entry.done: // if the client is disconnected, delete the client from the client map
+				case <-entry.done:
 					delete(clients, ch)
-					slog.Info("server: client disconnected", "symbols", entry.symbols, "total_clients", len(clients))
+					slog.Info("server: client gone", "total", len(clients))
 					continue
 				default:
 				}
 
-				// filter by subscription
-				if entry.symbols != nil {
-					// if the curr update is not for the asked symbol by the client - skip and continue
-					if _, want := entry.symbols[sym]; !want {
+				// filter by subscription keys - if they sent a subscription message with specific keys, only notify if the changed key is in their subscription list. If they did not send a subscription message, notify for every change.
+				if entry.keys != nil {
+					if _, want := entry.keys[key]; !want {
 						continue
 					}
 				}
 
-				// if the client is still connected and wants updates for this symbol, send the notification - if the client's notify channel buffer is full, skip sending the notification to avoid blocking the hub
+				// Send the notification
 				select {
-				case ch <- notification{Symbol: sym}:
+				case ch <- notification{key: key}:
 				default:
-					slog.Info("server: notify buffer full for client", "symbol", sym)
+					slog.Warn("server: notify buffer full", "key", key)
 				}
 			}
 
@@ -174,107 +175,101 @@ func (s *Server) runHub(ctx context.Context) {
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		slog.Error("server: failed to upgrade WebSocket connection", "error", err)
+		slog.Error("server: upgrade failed", "error", err)
 		return
 	}
-
 	defer conn.Close()
 
-	// reading optional subscription message from client - for now giving 1 second to read the message - if no message received, sending all snapshots for all symbols
-	var symbols map[domain.Symbol]struct{}
-	conn.SetReadDeadline(time.Now().Add(1 * time.Second)) // ! todo: take from config
+	// ! Read subscription message from the client (10 second deadline)
+	var keys map[domain.BookKey]struct{}
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, raw, err := conn.ReadMessage()
 	if err == nil {
-		var sub subscribeMessage
+		var sub subscribeRequest
 		if json.Unmarshal(raw, &sub) == nil && len(sub.Subscribe) > 0 {
-			symbols = make(map[domain.Symbol]struct{}, len(sub.Subscribe))
+			keys = make(map[domain.BookKey]struct{}, len(sub.Subscribe))
 			for _, s := range sub.Subscribe {
-				symbols[domain.Symbol(s)] = struct{}{}
+				k := domain.MakeBookKey(s.Exchange, domain.Symbol(s.Symbol))
+				keys[k] = struct{}{}
 			}
-			slog.Info("server: client subscription", "symbols", sub.Subscribe)
+			slog.Info("server: client subscription", "keys", keys)
 		}
 	}
-
-	// clearing read deadline
 	conn.SetReadDeadline(time.Time{})
 
-	notifyCh := make(chan notification, 64) // !TODO: 64
-	done := make(chan struct{})
+	notifyCh := make(chan notification, 64)  // hub writes notifications here, buffered to avoid blocking the hub
+	done := make(chan struct{})  // closed when the client disconnects
 
+	// register this client with the hub
 	s.register <- registration{
-		symbols:  symbols,
+		keys:     keys,
 		notifyCh: notifyCh,
 		done:     done,
 	}
 
-	// send initial snapshots for the subscribed symbols
-	s.sendInitialSnapshots(conn, symbols)
+	// send initial snapshots for subscribed books.
+	s.sendInitialSnapshots(conn, keys)
 
-	// read goroutine - pong handling and disconnection detection
+	// read goroutine for pong handling and disconnect detection.
 	go func() {
 		defer close(done)
-		conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2)) // if no message received in 2 ping intervals, consider the client disconnected
+		conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2))  // send a ping every PingInterval
 		conn.SetPongHandler(func(string) error {
-			conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2))
+			conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2))  // PongHandler received, connection is alive, extend the read deadline
 			return nil
 		})
-
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
 			}
 		}
-
 	}()
-
-	// track which symbols this client has already received snapshots for, first notification for a symbol should trigger a full snapshot send, subsequent notifications for the same symbol can be sent as deltas
-	seenSnapshot := make(map[domain.Symbol]bool)
-	for _, sym := range s.registry.Symbols() {
-		if symbols == nil {
-			seenSnapshot[sym] = true
-		} else if _, ok := symbols[sym]; ok {
-			seenSnapshot[sym] = true
+	
+	// track which books already got initial snapshots - so that when the hub sends teh first notification for a book, send it as "delta" not "snapshot"
+	seenSnapshot := make(map[domain.BookKey]bool)
+	for _, k := range s.registry.Keys() {
+		if keys == nil {
+			seenSnapshot[k] = true
+		} else if _, ok := keys[k]; ok {
+			seenSnapshot[k] = true
 		}
-
 	}
+
 	ticker := time.NewTicker(s.cfg.PingInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case notify, ok := <-notifyCh:
+		case n, ok := <-notifyCh:
 			if !ok {
-				return // shut down the hub
+				return
 			}
-			book, exists := s.registry.Get(notify.Symbol)
+			bk, exists := s.registry.Get(n.key)
 			if !exists {
 				continue
 			}
-			snap := book.BookSnapshot()
+			snap := bk.Snapshot()
 			msgType := "delta"
-			if !seenSnapshot[notify.Symbol] {
+			if !seenSnapshot[n.key] {
 				msgType = "snapshot"
-				seenSnapshot[notify.Symbol] = true
+				seenSnapshot[n.key] = true
 			}
 			msg := bookMessage{
 				Type:      msgType,
+				Exchange:  snap.Exchange,
 				Symbol:    string(snap.Symbol),
 				Bids:      snap.Bids,
 				Asks:      snap.Asks,
 				Timestamp: snap.LastUpdatedAt.Format(time.RFC3339Nano),
 			}
-			if err := writeMsg(conn, msg, s.cfg.WriteTimeout); err != nil {
-				slog.Info("server: failed to send message to client",
-					"symbol", snap.Symbol,
-					"error", err,
-				)
+			if err := writeJSON(conn, msg, s.cfg.WriteTimeout); err != nil {
+				slog.Info("server: write failed", "key", n.key, "error", err)
 				return
 			}
 
-		case <-ticker.C:
+		case <-ticker.C:  // ws ping to check if the client is still alive
 			conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -286,41 +281,37 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// to send the current full book for the requested symbols to a newly connected client
-func (s *Server) sendInitialSnapshots(conn *websocket.Conn, symbols map[domain.Symbol]struct{}) {
-	all := s.registry.Symbols()
-	for _, sym := range all {
-		if symbols != nil {
-			if _, ok := symbols[sym]; !ok {
+func (s *Server) sendInitialSnapshots(conn *websocket.Conn, keys map[domain.BookKey]struct{}) {
+	for _, k := range s.registry.Keys() {
+		if keys != nil {
+			if _, ok := keys[k]; !ok {
 				continue
 			}
 		}
-		book, ok := s.registry.Get(sym)
+		bk, ok := s.registry.Get(k)
 		if !ok {
 			continue
 		}
-		snap := book.BookSnapshot()
+		snap := bk.Snapshot()
 		if snap.LastUpdatedAt.IsZero() {
 			continue
 		}
 		msg := bookMessage{
 			Type:      "snapshot",
+			Exchange:  snap.Exchange,
 			Symbol:    string(snap.Symbol),
 			Bids:      snap.Bids,
 			Asks:      snap.Asks,
 			Timestamp: snap.LastUpdatedAt.Format(time.RFC3339Nano),
 		}
-		if err := writeMsg(conn, msg, s.cfg.WriteTimeout); err != nil {
-			slog.Info("server: failed to send initial snapshot",
-				"symbol", snap.Symbol,
-				"error", err,
-			)
+		if err := writeJSON(conn, msg, s.cfg.WriteTimeout); err != nil {
+			slog.Info("server: snapshot send failed", "key", k, "error", err)
 			return
 		}
 	}
 }
 
-func writeMsg(conn *websocket.Conn, msg bookMessage, timeout time.Duration) error {
+func writeJSON(conn *websocket.Conn, msg bookMessage, timeout time.Duration) error {
 	conn.SetWriteDeadline(time.Now().Add(timeout))
 	data, err := json.Marshal(msg)
 	if err != nil {

@@ -1,3 +1,49 @@
-// handles loading and validation of gateway configuration, including which symbols to subscribe to on each exchange
-
 package config
+
+import (
+	"flag"
+	"strings"
+	"time"
+
+	"market-gw.com/internal/domain"
+)
+
+type Config struct {
+	BinanceSymbols []domain.Symbol
+	Depth          int
+	Addr           string
+	WriteTimeout   time.Duration
+	PingInterval   time.Duration
+}
+
+func Load() Config {
+	var (
+		binanceSymbols string
+		depth          int
+		addr           string
+	)
+
+	flag.StringVar(&binanceSymbols, "binance", "BTCUSDT", "comma-separated Binance symbols (e.g. BTCUSDT,ETHUSDT)")
+	flag.IntVar(&depth, "depth", 10, "order book depth")
+	flag.StringVar(&addr, "addr", ":8080", "WebSocket server listen address")
+	flag.Parse()
+
+	return Config{
+		BinanceSymbols: parseSymbols(binanceSymbols),
+		Depth:          depth,
+		Addr:           addr,
+		WriteTimeout:   5 * time.Second,
+		PingInterval:   30 * time.Second,
+	}
+}
+
+func parseSymbols(raw string) []domain.Symbol {
+	var syms []domain.Symbol
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			syms = append(syms, domain.Symbol(s))
+		}
+	}
+	return syms
+}

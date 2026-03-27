@@ -6,49 +6,48 @@ import (
 	"market-gw.com/internal/domain"
 )
 
-// Registry holds the order books for configured symbols. - tracking more than one symbol at the same time
+// holds order books keyed by BookKey (exchange:symbol)
 type Registry struct {
 	mu    sync.Mutex
-	books map[domain.Symbol]*Book // symbol:book  // ! TODO: With the updated req needs to change the key - user needs to configure what s the symbol as well as what is his preferred excgange - sufficient to get the delta updates from the configured exchnage as well
+	books map[domain.BookKey]*Book
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		books: make(map[domain.Symbol]*Book),
+		books: make(map[domain.BookKey]*Book),
 	}
 }
 
-func (r *Registry) GetOrCreate(symbol domain.Symbol) *Book {
+func (r *Registry) GetOrCreate(exchange string, symbol domain.Symbol) *Book {
+	key := domain.MakeBookKey(exchange, symbol)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if b, ok := r.books[symbol]; ok {
+	if b, ok := r.books[key]; ok {
 		return b
 	}
 
-	b := NewBook(symbol)
-	r.books[symbol] = b
-
+	b := NewBook(exchange, symbol)
+	r.books[key] = b
 	return b
 }
 
-func (r *Registry) Get(symbol domain.Symbol) (*Book, bool) {
+func (r *Registry) Get(key domain.BookKey) (*Book, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	b, ok := r.books[symbol]
+	b, ok := r.books[key]
 	return b, ok
 }
 
-func (r *Registry) Symbols() []domain.Symbol {
+func (r *Registry) Keys() []domain.BookKey {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	symbols := make([]domain.Symbol, 0, len(r.books))
-	// iterating over keys
-	for sym := range r.books {
-		symbols = append(symbols, sym)
+	keys := make([]domain.BookKey, 0, len(r.books))
+	for k := range r.books {
+		keys = append(keys, k)
 	}
-
-	return symbols
+	return keys
 }

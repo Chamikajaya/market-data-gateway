@@ -1,9 +1,6 @@
-// maintains per symbol order book state (btc / eth ...) + applies incremental delta updates and produces snapshots for downstream clients
-
 package book
 
 import (
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -11,23 +8,24 @@ import (
 	"market-gw.com/internal/domain"
 )
 
+// maintains per-exchange, per-symbol order book state.
 type Book struct {
-	mu     sync.RWMutex // to avoid race conditions between pipeline writes & ws server reads - multiple go routines to read using RLock() + pipeline when writing Lock()
-	symbol domain.Symbol
+	mu       sync.RWMutex
+	exchange string
+	symbol   domain.Symbol
 
-	bids map[string]string
-	asks map[string]string
+	bids map[string]string // price → quantity
+	asks map[string]string // price → quantity
 
 	lastUpdated time.Time
 }
 
-func NewBook(symbol domain.Symbol) *Book {
-
+func NewBook(exchange string, symbol domain.Symbol) *Book {
 	return &Book{
-		symbol: symbol,
-		// maps:- instant lookups for delta updates
-		bids: make(map[string]string), // price:quantity
-		asks: make(map[string]string), // price: quantity
+		exchange: exchange,
+		symbol:   symbol,
+		bids:     make(map[string]string),
+		asks:     make(map[string]string),
 	}
 }
 
@@ -36,17 +34,15 @@ func (b *Book) Apply(u domain.Update) {
 	defer b.mu.Unlock()
 
 	switch u.Type {
-
 	case domain.UpdateTypeSnapshot:
 		b.bids = make(map[string]string, len(u.Bids))
 		b.asks = make(map[string]string, len(u.Asks))
 
-		for _, level := range u.Bids {
-			b.bids[level.Price] = level.Quantity
+		for _, lvl := range u.Bids {
+			b.bids[lvl.Price] = lvl.Quantity
 		}
-
-		for _, level := range u.Asks {
-			b.asks[level.Price] = level.Quantity
+		for _, lvl := range u.Asks {
+			b.asks[lvl.Price] = lvl.Quantity
 		}
 
 	case domain.UpdateTypeDelta:
@@ -55,72 +51,48 @@ func (b *Book) Apply(u domain.Update) {
 	}
 
 	b.lastUpdated = u.ReceivedAt
-
 }
 
-func isQuantityZero(quantity string) bool {
-	f, err := strconv.ParseFloat(quantity, 64)
+// returns an immutable copy of the current order book state.
+func (b *Book) Snapshot() domain.OrderBook {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	return domain.OrderBook{
+		Exchange:      b.exchange,
+		Symbol:        b.symbol,
+		Bids:          toLevels(b.bids),
+		Asks:          toLevels(b.asks),
+		LastUpdatedAt: b.lastUpdated,
+	}
+}
+
+// converts the internal map into a slice of Levels
+func toLevels(m map[string]string) []domain.Level {
+	if len(m) == 0 {
+		return nil
+	}
+	levels := make([]domain.Level, 0, len(m))
+	for price, qty := range m {
+		levels = append(levels, domain.Level{Price: price, Quantity: qty})
+	}
+	return levels
+}
+
+func applyLevels(m map[string]string, levels []domain.Level) {
+	for _, lvl := range levels {
+		if isZero(lvl.Quantity) {
+			delete(m, lvl.Price)
+		} else {
+			m[lvl.Price] = lvl.Quantity
+		}
+	}
+}
+
+func isZero(qty string) bool {
+	f, err := strconv.ParseFloat(qty, 64)
 	if err != nil {
 		return false
 	}
 	return f == 0
-}
-
-func applyLevels(m map[string]string, levels []domain.Level) {
-
-	for _, level := range levels {
-		// if the quantity is zero -> delete from map
-		if isQuantityZero(level.Quantity) {
-			delete(m, level.Price)
-		} else {
-			m[level.Price] = level.Quantity
-		}
-
-	}
-}
-
-func (b *Book) BookSnapshot() domain.OrderBook {
-	// used by many go routines
-	// to get an immutable copy of the current orderbook state
-	b.mu.RLock()
-	defer b.mu.Unlock()
-
-	return domain.OrderBook{
-		Symbol:        b.symbol,
-		Bids:          sortLevels(b.bids, true),
-		Asks:          sortLevels(b.asks, false),
-		LastUpdatedAt: b.lastUpdated,
-	}
-
-}
-
-func sortLevels(m map[string]string, isDescending bool) []domain.Level {
-	if (len(m)) == 0 {
-		return nil
-	}
-
-	sortedLevels := make([]domain.Level, 0, len(m))
-	// map to slice
-	for price, quantity := range m {
-		sortedLevels = append(sortedLevels, domain.Level{Price: price, Quantity: quantity})
-	}
-
-	sort.Slice(sortedLevels, func(i, j int) bool {
-
-		// ! TODO: Ignoring the error here -> need to handle the error parsing at adapter level
-		price_i, _ := strconv.ParseFloat(sortedLevels[i].Price, 64)
-		price_j, _ := strconv.ParseFloat(sortedLevels[j].Price, 64)
-
-		if isDescending {
-			return price_i > price_j
-		}
-
-		return price_i < price_j
-	})
-
-	return sortedLevels
-}
-
-func (b *Book) Symbol() domain.Symbol {
-	return b.symbol
 }

@@ -2,28 +2,28 @@ package domain
 
 import "time"
 
-// ! TODO: Use better naming with semantic meaning
-
-// ticker
 type Symbol string
 
-// ! TODO: rename to price point instead
+// uniquely identifies an order book: "exchange:symbol".
+type BookKey string
+
+func MakeBookKey(exchange string, symbol Symbol) BookKey {
+	return BookKey(exchange + ":" + string(symbol))
+}
+
+// single price point in the order book.
 type Level struct {
-	// used string to avoid floating point errors - consumers have to parse to decimal
-	Price    string
-	Quantity string
+	Price    string `json:"price"`
+	Quantity string `json:"qty"`
 }
 
 type UpdateType int8
 
 const (
-	// adapter has fetched a full order book via REST
 	UpdateTypeSnapshot UpdateType = iota
-	// adapter received a ws delta message
 	UpdateTypeDelta
 )
 
-// this is what every exchange must produce and what downstream stage (book/ pipeline / server ) consumes
 type Update struct {
 	Exchange   string
 	Symbol     Symbol
@@ -33,10 +33,11 @@ type Update struct {
 	ReceivedAt time.Time
 }
 
-// book package should maintain this and server package sends this to clients
+// current state of one book, ready to send to clients.
 type OrderBook struct {
-	Symbol        Symbol
-	Bids          []Level // sorted descending by price - best bid first
-	Asks          []Level // sorted ascending by price  - best ask first
+	Exchange      string  `json:"exchange"`
+	Symbol        Symbol  `json:"symbol"`
+	Bids          []Level `json:"bids"`
+	Asks          []Level `json:"asks"`
 	LastUpdatedAt time.Time
 }
