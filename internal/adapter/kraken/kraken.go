@@ -177,7 +177,7 @@ type bookMsg struct {
 }
 
 type bookEntry struct {
-	Symbol string       `json:"symbol"`
+	Symbol string        `json:"symbol"`
 	Bids   []krakenLevel `json:"bids"`
 	Asks   []krakenLevel `json:"asks"`
 }

@@ -105,12 +105,12 @@ func (s *Server) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	slog.Info("server: shutting down")
-	
+
 	// graceful shutdown with 5 seconds timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdownCtx)
-	
+
 	// waits for the hub and http server goroutines to exit
 	wg.Wait()
 	slog.Info("server: shutdown complete")
@@ -120,7 +120,7 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) runHub(ctx context.Context) {
 
 	// runHub is run in a single goroutine + owns the client map -> no mutexes needed since there is no concurrent access to the client map
-	clients := make(map[chan<- notification]registration)  // key: client's notification channel - each channel is unique in go
+	clients := make(map[chan<- notification]registration) // key: client's notification channel - each channel is unique in go
 
 	for {
 		select {
@@ -128,7 +128,7 @@ func (s *Server) runHub(ctx context.Context) {
 		case reg := <-s.register:
 			clients[reg.notifyCh] = reg
 			slog.Info("server: client registered", "keys", reg.keys, "total", len(clients))
-		
+
 		// CASE 2 :- A book changed, notify interested clients
 		case key, ok := <-s.changed:
 			// if pipeline is done, closing every client's notification channel
@@ -139,7 +139,7 @@ func (s *Server) runHub(ctx context.Context) {
 				}
 				return
 			}
-			
+
 			// fan out to interested clients
 			for ch, entry := range clients {
 				select {
@@ -199,8 +199,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	notifyCh := make(chan notification, 64)  // hub writes notifications here, buffered to avoid blocking the hub
-	done := make(chan struct{})  // closed when the client disconnects
+	notifyCh := make(chan notification, 64) // hub writes notifications here, buffered to avoid blocking the hub
+	done := make(chan struct{})             // closed when the client disconnects
 
 	// register this client with the hub
 	s.register <- registration{
@@ -215,9 +215,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// read goroutine for pong handling and disconnect detection.
 	go func() {
 		defer close(done)
-		conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2))  // send a ping every PingInterval
+		conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2)) // send a ping every PingInterval
 		conn.SetPongHandler(func(string) error {
-			conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2))  // PongHandler received, connection is alive, extend the read deadline
+			conn.SetReadDeadline(time.Now().Add(s.cfg.PingInterval * 2)) // PongHandler received, connection is alive, extend the read deadline
 			return nil
 		})
 		for {
@@ -226,7 +226,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	
+
 	// track which books already got initial snapshots - so that when the hub sends teh first notification for a book, send it as "delta" not "snapshot"
 	seenSnapshot := make(map[domain.BookKey]bool)
 	for _, k := range s.registry.Keys() {
@@ -269,7 +269,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-		case <-ticker.C:  // ws ping to check if the client is still alive
+		case <-ticker.C: // ws ping to check if the client is still alive
 			conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
