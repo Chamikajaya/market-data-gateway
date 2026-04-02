@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"market-gw.com/internal/adapter/binance"
+	"market-gw.com/internal/adapter/kraken"
 	"market-gw.com/internal/book"
 	"market-gw.com/internal/config"
 	"market-gw.com/internal/pipeline"
@@ -19,6 +20,7 @@ func main() {
 
 	slog.Info("starting market-data-gateway",
 		"binance_symbols", cfg.BinanceSymbols,
+		"kraken_symbols", cfg.KrakenSymbols,
 		"depth", cfg.Depth,
 		"addr", cfg.Addr,
 	)
@@ -33,7 +35,9 @@ func main() {
 	if len(cfg.BinanceSymbols) > 0 {
 		exchanges = append(exchanges, binance.NewAdapter(cfg.BinanceSymbols, cfg.Depth))
 	}
-	
+	if len(cfg.KrakenSymbols) > 0 {
+		exchanges = append(exchanges, kraken.NewAdapter(cfg.KrakenSymbols, cfg.Depth))
+	}
 
 	p := pipeline.NewPipeline(exchanges, registry)
 

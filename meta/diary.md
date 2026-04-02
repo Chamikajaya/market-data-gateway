@@ -102,3 +102,34 @@ What broke (and why):
 - Composite map keys — using a typed string (`BookKey = "binance:BTCUSDT"`) as a map key is simple and avoids needing a struct key (structs work but are more verbose).
 
 **Next**: Implement the end to end flow for Kraken
+
+## 03/27 & 03/30— Integrated Kraken exchange adapter
+
+**Goal**: Add Kraken as a second exchange so clients can get order books from both Binance and Kraken.
+
+**What Worked**:
+
+- **`adapter/kraken/kraken.go`** — built the full Kraken adapter. Key differences from Binance:
+  - **No REST sync needed** — Kraken's WS v2 `book` channel sends the snapshot automatically after we subscribe, so there is no need for the REST-fetch-then-sync process that Binance requires.
+  - **Single WS connection** — all symbols go through one connection. After dialing `wss://ws.kraken.com/v2`, we send one subscribe message listing all symbols and receive snapshots + updates for all of them on that connection.
+  - **Subscribe message format**:
+    ```json
+    {
+      "method": "subscribe",
+      "params": {
+        "channel": "book",
+        "symbol": ["BTC/USD", "ETH/USD"],
+        "depth": 10
+      }
+    }
+    ```
+  - **Message parsing** — Kraken WS v2 sends several message types on the same connection: heartbeats, subscribe acks, and book data. Used a `peekMsg` struct with just `channel` and `type` to quickly classify messages before full parsing. Only messages with `channel == "book"` get parsed as `bookMsg`.
+  - **Price/quantity format** — Kraken sends `price` and `qty` as JSON floats (e.g., `0.5666`, `4831.75496356`), unlike Binance which sends string pairs (`["87255.99","0.01"]`). Used `strconv.FormatFloat(price, 'f', -1, 64)` to convert to string without losing precision. The `-1` precision flag tells Go to use the minimum number of digits needed to represent the float exactly.
+  - **Symbol format** — Kraken uses slash-separated pairs like `BTC/USD`, `ETH/USD` (not `BTCUSDT`). We pass these through as-is.
+
+**Concepts unlocked**:
+
+- **Duck typing / interface satisfaction** — both `binance.Adapter` and `kraken.Adapter` implement `pipeline.Exchanger` (the `Run(ctx) (<-chan domain.Update, error)` + `Name() string` interface) without explicitly declaring it. Go checks at compile time.
+
+- **`strconv.FormatFloat` with precision `-1`** — this tells Go to use the shortest representation that, when parsed back, produces the exact same float64. This avoids ugly trailing zeros or imprecise decimal expansions.
+- **Message classification pattern** — parsing a "peek" struct first (`{channel, type}`) to route messages before doing the full unmarshal is efficient and avoids parsing heartbeats/acks as book data.
